@@ -16,6 +16,7 @@ int nextpid = 1;
 struct spinlock pid_lock;
 
 extern void forkret(void);
+extern pagetable_t kernel_pagetable;
 static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
@@ -26,21 +27,13 @@ void
 procinit(void)
 {
   struct proc *p;
-  
-  initlock(&pid_lock, "nextpid");
-  for(p = proc; p < &proc[NPROC]; p++) {
-      initlock(&p->lock, "proc");
 
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+  initlock(&pid_lock, "nextpid");
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    initlock(&p->lock, "proc");
   }
+
   kvminithart();
 }
 
@@ -107,6 +100,34 @@ allocproc(void)
 found:
   p->pid = allocpid();
 
+  // 创建这个进程自己的内核页表。
+p->kpagetable = kvmmake();
+if(p->kpagetable == 0){
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+
+// 为这个进程分配内核栈物理页。
+char *pa = kalloc();
+if(pa == 0){
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+
+p->kstack = KSTACK((int)(p - proc));
+
+// 把内核栈映射到进程自己的内核页表。
+if(mappages(p->kpagetable, p->kstack, PGSIZE,
+            (uint64)pa, PTE_R | PTE_W) != 0){
+  kfree(pa);
+  p->kstack = 0;
+  freeproc(p);
+  release(&p->lock);
+  return 0;
+}
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     release(&p->lock);
@@ -139,6 +160,15 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+    if(p->kpagetable){
+    if(p->kstack)
+      uvmunmap(p->kpagetable, p->kstack, 1, 1);
+
+    kvmfree(p->kpagetable);
+  }
+
+  p->kpagetable = 0;
+  p->kstack = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -221,6 +251,9 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  if(uvm2k(p->pagetable, p->kpagetable, 0, p->sz) < 0)
+  panic("userinit: uvm2k");
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -238,17 +271,48 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint64 sz;
+  uint64 oldsz;
   struct proc *p = myproc();
 
   sz = p->sz;
+
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    /*
+     * 防止整数溢出，并防止用户地址增长到 PLIC。
+     */
+    if(sz + n < sz || sz + n >= PLIC)
+      return -1;
+
+    oldsz = sz;
+
+    if((sz = uvmalloc(p->pagetable, oldsz, oldsz + n)) == 0)
+      return -1;
+
+    if(uvm2k(p->pagetable, p->kpagetable,
+             oldsz, sz) < 0){
+      uvmdealloc(p->pagetable, sz, oldsz);
       return -1;
     }
+
+    sfence_vma();
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    oldsz = sz;
+
+    sz = uvmdealloc(p->pagetable, oldsz, oldsz + n);
+
+    if(PGROUNDUP(sz) < PGROUNDUP(oldsz)){
+      uvmunmap(
+        p->kpagetable,
+        PGROUNDUP(sz),
+        (PGROUNDUP(oldsz) - PGROUNDUP(sz)) / PGSIZE,
+        0
+      );
+
+      sfence_vma();
+    }
   }
+
   p->sz = sz;
   return 0;
 }
@@ -274,6 +338,11 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+  if(uvm2k(np->pagetable, np->kpagetable, 0, np->sz) < 0){
+  freeproc(np);
+  release(&np->lock);
+  return -1;
+}
 
   np->parent = p;
 
@@ -468,15 +537,19 @@ scheduler(void)
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 切换到当前进程自己的内核页表。
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
+        // 进程停止运行后，恢复全局内核页表。
+        w_satp(MAKE_SATP(kernel_pagetable));
+        sfence_vma();
+
         c->proc = 0;
 
         found = 1;

@@ -1,0 +1,23 @@
+1.Explain the output of vmprint in terms of Fig 3-4 from the text. 
+  What does page 0 contain? What is in page 2? When running in user mode, could the process read/write the memory mapped by page 1?
+vmprint输出展示了RISC-V Sv39三级页表的结构。
+每一行代表一个有效的页表项PTE。缩进表示页表所在的层级：
+一级缩进表示根页表中的页表项，二级缩进表示第二级页表中的页表项，三级缩进表示第三级页表中的页表项。
+如果一个有效页表项没有设置PTE_R、PTE_W和PTE_X权限位，那么它不是叶子页表项，而是指向下一级页表；如果设置了这些权限位，则它是叶子页表项，负责把虚拟页面映射到物理页面。
+第0页中保存了init进程的程序代码和数据。
+第2页中保存了init进程的用户栈。
+第1页是用户栈的保护页。它的页表项没有设置PTE_U权限位，因此当进程运行在用户模式时，不能读取或写入第1页。该页面用于检测用户栈向下越界。
+
+
+2.Explain why the third test srcva + len < srcva is necessary in copyin_new(): give values for srcva and len for which the first two test fail (i.e., they will not cause to return -1) but for which the third one is true (resulting in returning -1).
+条件 srcva + len < srcva 用于检测无符号整数加法溢出。
+srcva 和 len 都是 uint64 类型。当 srcva + len 超过 uint64 能表示的最大值时，计算结果会回绕到一个较小的数。因此，如果计算结果小于起始地址 srcva，就说明加法发生了溢出。
+例如：
+srcva = 4096
+len = UINT64_MAX - 4095
+此时 srcva + len 的真实数学结果超过了 uint64 的最大值，因此在 uint64 中会回绕为 0。
+假设 p->sz 大于 4096，那么：
+srcva >= p->sz 为假；
+srcva + len >= p->sz 也为假，因为回绕后的结果是 0；
+但是 srcva + len < srcva 为真，因为 0 小于 4096。
+因此，第三个条件可以检测出前两个条件无法发现的地址加法溢出，防止 copyin_new 接受一个非法的用户地址范围。

@@ -48,6 +48,8 @@ exec(char *path, char **argv)
       goto bad;
     if(ph.vaddr + ph.memsz < ph.vaddr)
       goto bad;
+    if(ph.vaddr + ph.memsz >= PLIC)
+      goto bad;
     uint64 sz1;
     if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
       goto bad;
@@ -110,12 +112,42 @@ exec(char *path, char **argv)
     
   // Commit to the user image.
   oldpagetable = p->pagetable;
-  p->pagetable = pagetable;
-  p->sz = sz;
+oldsz = p->sz;
+
+/*
+ * 先删除旧用户空间在进程内核页表中的映射。
+ * do_free 为 0，因为这些物理页仍由旧用户页表管理。
+ */
+if(PGROUNDUP(oldsz) > 0){
+  uvmunmap(p->kpagetable, 0,
+           PGROUNDUP(oldsz) / PGSIZE, 0);
+}
+
+/*
+ * 将新程序的用户映射加入进程内核页表。
+ */
+if(uvm2k(pagetable, p->kpagetable, 0, sz) < 0){
+  /*
+   * 新映射失败时，恢复旧程序映射。
+   * uvm2k 自身会清理本次已经添加的新映射。
+   */
+  if(uvm2k(oldpagetable, p->kpagetable,
+           0, oldsz) < 0)
+    panic("exec: restore kpagetable");
+
+  sfence_vma();
+  goto bad;
+}
+
+sfence_vma();
+
+p->pagetable = pagetable;
+p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
-
+  if(p->pid == 1)
+    vmprint(p->pagetable);
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
  bad:
