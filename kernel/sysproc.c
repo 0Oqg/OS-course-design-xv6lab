@@ -69,7 +69,9 @@ sys_sleep(void)
     }
     sleep(&ticks, &tickslock);
   }
+  
   release(&tickslock);
+  backtrace();
   return 0;
 }
 
@@ -94,4 +96,50 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_sigalarm(void)
+{
+  int ticks;
+  uint64 handler;
+  struct proc *p = myproc();
+
+  if(argint(0, &ticks) < 0)
+    return -1;
+
+  if(argaddr(1, &handler) < 0)
+    return -1;
+
+  if(ticks < 0)
+    return -1;
+
+  p->alarm_interval = ticks;
+  p->alarm_handler = handler;
+  p->alarm_ticks = 0;
+
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+
+  if(p->alarm_active == 0)
+    return -1;
+
+  // 保存原本的 a0。
+  // syscall() 返回后会把系统调用返回值重新写入 trapframe->a0。
+  uint64 saved_a0 = p->alarm_tf.a0;
+
+  // 恢复时钟中断发生前的全部用户寄存器
+  memmove(p->trapframe,
+          &p->alarm_tf,
+          sizeof(struct trapframe));
+
+  p->alarm_active = 0;
+  p->alarm_ticks = 0;
+
+  return saved_a0;
 }

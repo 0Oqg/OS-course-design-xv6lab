@@ -121,6 +121,7 @@ panic(char *s)
   printf("panic: ");
   printf(s);
   printf("\n");
+  backtrace();
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;
@@ -131,4 +132,28 @@ printfinit(void)
 {
   initlock(&pr.lock, "pr");
   pr.locking = 1;
+}
+
+void
+backtrace(void)
+{
+  uint64 fp = r_fp();
+  uint64 stack_bottom = PGROUNDDOWN(fp);
+  uint64 stack_top = PGROUNDUP(fp);
+
+  printf("backtrace:\n");
+
+  while(fp >= stack_bottom + 16 && fp < stack_top){
+    uint64 ra = *(uint64 *)(fp - 8);
+    uint64 next_fp = *(uint64 *)(fp - 16);
+
+    printf("%p\n", ra);
+
+    // 正常情况下，调用者的 fp 应该更大。
+    // 防止错误的 fp 导致死循环或越界访问。
+    if(next_fp <= fp || next_fp > stack_top)
+      break;
+
+    fp = next_fp;
+  }
 }
