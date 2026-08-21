@@ -23,10 +23,19 @@ struct {
   struct run *freelist;
 } kmem;
 
+#define NPAGE ((PHYSTOP - KERNBASE) / PGSIZE)
+#define PA2IDX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
+
+struct {
+  struct spinlock lock;
+  int cnt[NPAGE];
+} refcnt;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&refcnt.lock, "refcnt");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -35,8 +44,11 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+    refcnt.cnt[PA2IDX(p)] = 1;
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by v,
@@ -48,10 +60,31 @@ kfree(void *pa)
 {
   struct run *r;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (char*)pa < end ||
+     (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
+  // 引用计数减 1
+  acquire(&refcnt.lock);
+
+  refcnt.cnt[PA2IDX(pa)]--;
+
+  // 还有其他进程在使用这个物理页，不能真正释放
+  if(refcnt.cnt[PA2IDX(pa)] > 0){
+    release(&refcnt.lock);
+    return;
+  }
+
+  // 出现负数说明引用计数逻辑有问题
+  if(refcnt.cnt[PA2IDX(pa)] < 0){
+    release(&refcnt.lock);
+    panic("kfree ref");
+  }
+
+  release(&refcnt.lock);
+
+  // 引用计数已经为 0，真正释放物理页
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
@@ -76,7 +109,21 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+  if(r){
+    memset((char*)r, 5, PGSIZE);
+
+    acquire(&refcnt.lock);
+    refcnt.cnt[PA2IDX(r)] = 1;
+    release(&refcnt.lock);
+  }
   return (void*)r;
 }
+
+void
+krefinc(uint64 pa)
+{
+  acquire(&refcnt.lock);
+  refcnt.cnt[PA2IDX(pa)]++;
+  release(&refcnt.lock);
+}
+
