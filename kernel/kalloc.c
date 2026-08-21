@@ -21,12 +21,16 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+} kmem[NCPU];
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  for(int i = 0; i < NCPU; i++){
+    initlock(&kmem[i].lock, "kmem");
+    kmem[i].freelist = 0;
+  }
+
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -48,18 +52,27 @@ kfree(void *pa)
 {
   struct run *r;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (char*)pa < end ||
+     (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  push_off();
+
+  int id = cpuid();
+
+  acquire(&kmem[id].lock);
+
+  r->next = kmem[id].freelist;
+  kmem[id].freelist = r;
+
+  release(&kmem[id].lock);
+
+  pop_off();
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -68,15 +81,88 @@ kfree(void *pa)
 void *
 kalloc(void)
 {
-  struct run *r;
+  struct run *r = 0;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+  push_off();
+
+  int id = cpuid();
+
+  // 先从当前 CPU 的 freelist 获取
+  acquire(&kmem[id].lock);
+
+  r = kmem[id].freelist;
+
+  if(r){
+    kmem[id].freelist = r->next;
+    r->next = 0;
+  }
+
+  release(&kmem[id].lock);
+
+  // 当前 CPU 没有空闲页，去其它 CPU 偷
+  if(r == 0){
+
+    for(int i = 0; i < NCPU; i++){
+
+      if(i == id)
+        continue;
+
+      acquire(&kmem[i].lock);
+
+      if(kmem[i].freelist){
+
+        // 统计 victim CPU 有多少空闲页
+        int count = 0;
+
+        struct run *p = kmem[i].freelist;
+
+        while(p){
+          count++;
+          p = p->next;
+        }
+
+        // 偷一半
+        int steal = count / 2;
+
+        if(steal < 1)
+          steal = 1;
+
+        struct run *head = kmem[i].freelist;
+        struct run *last = head;
+
+        for(int j = 1; j < steal; j++)
+          last = last->next;
+
+        // 从 victim freelist 中摘下来
+        kmem[i].freelist = last->next;
+        last->next = 0;
+
+        release(&kmem[i].lock);
+
+        // 加入当前 CPU freelist
+        acquire(&kmem[id].lock);
+
+        last->next = kmem[id].freelist;
+        kmem[id].freelist = head;
+
+        // 当前这次 kalloc 直接拿走一个
+        r = kmem[id].freelist;
+        kmem[id].freelist = r->next;
+        r->next = 0;
+
+        release(&kmem[id].lock);
+
+        break;
+      }
+
+      release(&kmem[i].lock);
+    }
+  }
+
+  pop_off();
 
   if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+    memset((char*)r, 5, PGSIZE);
+
   return (void*)r;
 }
