@@ -380,26 +380,111 @@ bmap(struct inode *ip, uint bn)
   uint addr, *a;
   struct buf *bp;
 
+
+  // direct
   if(bn < NDIRECT){
+
     if((addr = ip->addrs[bn]) == 0)
       ip->addrs[bn] = addr = balloc(ip->dev);
+
     return addr;
   }
+
+
+  // single indirect
   bn -= NDIRECT;
 
+
   if(bn < NINDIRECT){
-    // Load indirect block, allocating if necessary.
+
     if((addr = ip->addrs[NDIRECT]) == 0)
       ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+
+
     bp = bread(ip->dev, addr);
+
     a = (uint*)bp->data;
+
+
     if((addr = a[bn]) == 0){
+
       a[bn] = addr = balloc(ip->dev);
+
       log_write(bp);
     }
+
+
     brelse(bp);
+
     return addr;
   }
+
+
+
+  // ==========================
+  // double indirect
+  // ==========================
+
+  bn -= NINDIRECT;
+
+
+  if(bn < NINDIRECT * NINDIRECT){
+
+
+    if(ip->addrs[NDIRECT+1] == 0)
+      ip->addrs[NDIRECT+1] = balloc(ip->dev);
+
+
+
+    // 第一层 indirect
+    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+
+    a = (uint*)bp->data;
+
+
+    uint first = bn / NINDIRECT;
+    uint second = bn % NINDIRECT;
+
+
+
+    if(a[first] == 0){
+
+      a[first] = balloc(ip->dev);
+
+      log_write(bp);
+    }
+
+
+    brelse(bp);
+
+
+
+    // 第二层 indirect
+
+    bp = bread(ip->dev, a[first]);
+
+    a = (uint*)bp->data;
+
+
+
+    if(a[second] == 0){
+
+      a[second] = balloc(ip->dev);
+
+      log_write(bp);
+    }
+
+
+    addr = a[second];
+
+
+    brelse(bp);
+
+
+    return addr;
+  }
+
+
 
   panic("bmap: out of range");
 }
@@ -413,6 +498,7 @@ itrunc(struct inode *ip)
   struct buf *bp;
   uint *a;
 
+  // 1. 释放 direct blocks
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
       bfree(ip->dev, ip->addrs[i]);
@@ -420,19 +506,96 @@ itrunc(struct inode *ip)
     }
   }
 
+
+  // 2. 释放 single indirect block
   if(ip->addrs[NDIRECT]){
+
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
+
     a = (uint*)bp->data;
-    for(j = 0; j < NINDIRECT; j++){
-      if(a[j])
-        bfree(ip->dev, a[j]);
+
+
+    for(i = 0; i < NINDIRECT; i++){
+
+      if(a[i])
+        bfree(ip->dev, a[i]);
+
     }
+
+
     brelse(bp);
+
+
     bfree(ip->dev, ip->addrs[NDIRECT]);
+
     ip->addrs[NDIRECT] = 0;
   }
 
+
+
+  // 3. 释放 double indirect block
+  if(ip->addrs[NDIRECT+1]){
+
+    // 第一层 double indirect block
+    bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+
+    a = (uint*)bp->data;
+
+
+
+    for(i = 0; i < NINDIRECT; i++){
+
+      if(a[i]){
+
+
+        // 第二层 indirect block
+        struct buf *bp2;
+        uint *a2;
+
+
+        bp2 = bread(ip->dev, a[i]);
+
+        a2 = (uint*)bp2->data;
+
+
+
+        // 释放数据 block
+        for(j = 0; j < NINDIRECT; j++){
+
+          if(a2[j])
+            bfree(ip->dev, a2[j]);
+
+        }
+
+
+
+        brelse(bp2);
+
+
+
+        // 释放第二层 indirect block
+        bfree(ip->dev, a[i]);
+
+      }
+    }
+
+
+
+    brelse(bp);
+
+
+
+    // 释放第一层 double indirect block
+    bfree(ip->dev, ip->addrs[NDIRECT+1]);
+
+    ip->addrs[NDIRECT+1] = 0;
+
+  }
+
+
+
   ip->size = 0;
+
   iupdate(ip);
 }
 

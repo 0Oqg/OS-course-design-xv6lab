@@ -304,11 +304,48 @@ sys_open(void)
       return -1;
     }
   } else {
-    if((ip = namei(path)) == 0){
-      end_op();
-      return -1;
+
+    int depth = 0;
+
+    // 不断解析符号链接
+    while(1){
+
+      if((ip = namei(path)) == 0){
+        end_op();
+        return -1;
+      }
+
+      ilock(ip);
+
+      // 不是符号链接，或者指定了 O_NOFOLLOW
+      if(ip->type != T_SYMLINK || (omode & O_NOFOLLOW))
+        break;
+
+      // 防止 a -> b -> a 无限循环
+      if(depth++ >= 10){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      // 读取符号链接保存的目标路径
+      int len = readi(ip, 0, (uint64)path, 0, MAXPATH - 1);
+
+      if(len <= 0){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      // 非常重要：保证字符串以 \0 结束
+      path[len] = '\0';
+
+      // 当前 symlink inode 已经没用了
+      iunlockput(ip);
+
+      // 下一次循环 namei(path)
     }
-    ilock(ip);
+
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -337,6 +374,7 @@ sys_open(void)
     f->type = FD_INODE;
     f->off = 0;
   }
+
   f->ip = ip;
   f->readable = !(omode & O_WRONLY);
   f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
@@ -482,5 +520,36 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH];
+  char path[MAXPATH];
+  struct inode *ip;
+
+  if(argstr(0, target, MAXPATH) < 0 ||
+     argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+
+  int len = strlen(target);
+
+  if(writei(ip, 0, (uint64)target, 0, len) != len){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
+
   return 0;
 }
