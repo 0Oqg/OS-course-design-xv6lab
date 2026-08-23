@@ -109,10 +109,33 @@ allocproc(void)
       release(&p->lock);
     }
   }
+
   return 0;
+
 
 found:
   p->pid = allocpid();
+
+
+  // ========= mmap 初始化 =========
+
+  // mmap 从 TRAPFRAME 向低地址增长
+  p->mmap_top = TRAPFRAME;
+
+
+  // 清空 VMA 表
+  for(int i = 0; i < NVMA; i++){
+    p->vmas[i].used = 0;
+    p->vmas[i].file = 0;
+    p->vmas[i].addr = 0;
+    p->vmas[i].length = 0;
+    p->vmas[i].offset = 0;
+    p->vmas[i].prot = 0;
+    p->vmas[i].flags = 0;
+  }
+
+
+  // ========= 原来的代码 =========
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -120,19 +143,23 @@ found:
     return 0;
   }
 
-  // An empty user page table.
+
+  // An empty pagetable.
   p->pagetable = proc_pagetable(p);
+
   if(p->pagetable == 0){
     freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
+
+  // Set up new context to start executing at forkret
   memset(&p->context, 0, sizeof(p->context));
+
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
 
   return p;
 }
@@ -289,7 +316,18 @@ fork(void)
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
+  // copy mmap regions
+np->mmap_top = p->mmap_top;
 
+for(int i = 0; i < NVMA; i++){
+
+  if(p->vmas[i].used){
+
+    np->vmas[i] = p->vmas[i];
+
+    filedup(np->vmas[i].file);
+  }
+}
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
@@ -343,7 +381,24 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+  // Close mmap regions
+for(int i = 0; i < NVMA; i++){
 
+  struct vma *v = &p->vmas[i];
+
+  if(v->used){
+
+    vmaunmap(p,
+             v,
+             v->addr,
+             v->length);
+
+    fileclose(v->file);
+
+    v->used = 0;
+    v->file = 0;
+  }
+}
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){

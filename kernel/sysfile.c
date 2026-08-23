@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -483,4 +484,204 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  uint64 length;
+  uint64 offset;
+  int prot;
+  int flags;
+  int fd;
+  struct file *f;
+
+  if(argaddr(0, &addr) < 0 ||
+     argaddr(1, &length) < 0 ||
+     argint(2, &prot) < 0 ||
+     argint(3, &flags) < 0 ||
+     argfd(4, &fd, &f) < 0 ||
+     argaddr(5, &offset) < 0)
+    return -1;
+
+  // 本实验中 addr 和 offset 都可以认为固定为 0
+  if(addr != 0 || offset != 0 || length == 0)
+    return -1;
+
+  // mmap 这里只支持普通 inode 文件
+  if(f->type != FD_INODE)
+    return -1;
+
+  // 要读映射，文件必须可读
+  if((prot & PROT_READ) && !f->readable)
+    return -1;
+
+  // MAP_SHARED + 可写映射，文件本身必须可写
+  if((flags & MAP_SHARED) &&
+     (prot & PROT_WRITE) &&
+     !f->writable)
+    return -1;
+
+  if(flags != MAP_SHARED && flags != MAP_PRIVATE)
+    return -1;
+
+  struct proc *p = myproc();
+
+  struct vma *v = 0;
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used == 0){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+
+  if(v == 0)
+    return -1;
+
+  uint64 len = PGROUNDUP(length);
+
+  if(p->mmap_top < len)
+    return -1;
+
+  uint64 va = p->mmap_top - len;
+
+  // 防止 mmap 区域与普通用户内存碰撞
+  if(va < PGROUNDUP(p->sz))
+    return -1;
+
+  p->mmap_top = va;
+
+  v->used = 1;
+  v->addr = va;
+  v->length = len;
+  v->prot = prot;
+  v->flags = flags;
+  v->file = f;
+  v->offset = offset;
+
+  // mmap 后即使用户 close(fd)，VMA 中的 file 仍然必须有效
+  filedup(f);
+
+  return va;
+}
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  uint64 length;
+
+
+  if(argaddr(0, &addr) < 0 ||
+     argaddr(1, &length) < 0)
+    return -1;
+
+
+  if(length == 0)
+    return -1;
+
+
+  if(addr % PGSIZE != 0)
+    return -1;
+
+
+  length = PGROUNDUP(length);
+
+
+  struct proc *p = myproc();
+
+  struct vma *v = 0;
+
+
+  // 找对应 VMA
+  for(int i = 0; i < NVMA; i++){
+
+    if(!p->vmas[i].used)
+      continue;
+
+
+    uint64 start = p->vmas[i].addr;
+
+    uint64 end =
+      start + p->vmas[i].length;
+
+
+    if(addr >= start &&
+       addr + length <= end){
+
+      v = &p->vmas[i];
+      break;
+    }
+  }
+
+
+  if(v == 0)
+    return -1;
+
+
+
+  uint64 vend = v->addr + v->length;
+
+
+
+  /*
+   * xv6 mmap 实验不要求支持中间拆分
+   *
+   * 只允许：
+   * 1. 删除整个 VMA
+   * 2. 删除前面
+   * 3. 删除后面
+   */
+
+  if(addr != v->addr &&
+     addr + length != vend)
+    return -1;
+
+
+
+  vmaunmap(p,
+           v,
+           addr,
+           length);
+
+
+
+  // 删除整个映射
+  if(addr == v->addr &&
+     length == v->length){
+
+    fileclose(v->file);
+
+    v->used = 0;
+    v->file = 0;
+
+    return 0;
+  }
+
+
+
+  // 删除开头部分
+  if(addr == v->addr){
+
+    v->addr += length;
+
+    v->offset += length;
+
+    v->length -= length;
+
+    return 0;
+  }
+
+
+
+  // 删除尾部部分
+  if(addr + length == vend){
+
+    v->length -= length;
+
+    return 0;
+  }
+
+
+  return -1;
 }

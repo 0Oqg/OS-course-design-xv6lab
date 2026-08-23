@@ -1,10 +1,19 @@
 #include "param.h"
 #include "types.h"
 #include "memlayout.h"
-#include "elf.h"
 #include "riscv.h"
-#include "defs.h"
+
+#include "spinlock.h"
+#include "sleeplock.h"
+
 #include "fs.h"
+#include "file.h"
+#include "fcntl.h"
+
+#include "proc.h"
+
+#include "defs.h"
+#include "elf.h"
 
 /*
  * the kernel's page table.
@@ -428,4 +437,63 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+void
+vmaunmap(struct proc *p, struct vma *v, uint64 addr, uint64 len)
+{
+  uint64 end = addr + len;
+
+  if((v->flags & MAP_SHARED) &&
+     (v->prot & PROT_WRITE))
+    begin_op();
+
+
+  for(uint64 a = addr; a < end; a += PGSIZE){
+
+    pte_t *pte = walk(p->pagetable, a, 0);
+
+
+    // lazy mmap 页面可能不存在
+    if(pte == 0 || (*pte & PTE_V) == 0)
+      continue;
+
+
+    if((v->flags & MAP_SHARED) &&
+       (v->prot & PROT_WRITE)){
+
+
+      uint64 n = PGSIZE;
+
+      if(a+n > v->addr+v->length)
+        n = v->addr+v->length-a;
+
+
+      uint64 off =
+          v->offset + (a-v->addr);
+
+
+      ilock(v->file->ip);
+
+
+      writei(v->file->ip,
+             1,
+             a,
+             off,
+             n);
+
+
+      iunlock(v->file->ip);
+    }
+
+
+    uvmunmap(p->pagetable,
+             a,
+             1,
+             1);
+  }
+
+
+  if((v->flags & MAP_SHARED) &&
+     (v->prot & PROT_WRITE))
+    end_op();
 }
